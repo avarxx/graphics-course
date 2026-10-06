@@ -96,8 +96,8 @@ void App::processInput()
 {
   if (osWindow->keyboard[KeyboardKey::kR] == ButtonState::Falling)
   {
-    const int retval = std::system(
-      "cd " LOCAL_SHADERTOY_BUILD_DIR " && cmake --build . --target local_shadertoy1_shaders");
+    const int retval = std::system("cd " LOCAL_SHADERTOY_BUILD_DIR
+                                   " && cmake --build . --target local_shadertoy1_shaders");
     if (retval == 0)
     {
       ETNA_CHECK_VK_RESULT(etna::get_context().getDevice().waitIdle());
