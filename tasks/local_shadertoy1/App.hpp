@@ -1,5 +1,7 @@
 #pragma once
 
+#include <chrono>
+
 #include <etna/Window.hpp>
 #include <etna/PerFrameCmdMgr.hpp>
 #include <etna/ComputePipeline.hpp>
@@ -18,6 +20,7 @@ public:
 
 private:
   void drawFrame();
+  void processInput();
 
 private:
   OsWindowingManager windowing;
@@ -28,4 +31,10 @@ private:
 
   std::unique_ptr<etna::Window> vkWindow;
   std::unique_ptr<etna::PerFrameCmdMgr> commandManager;
+
+  etna::ComputePipeline toyPipeline;
+  etna::Image resultImage;
+
+  std::chrono::steady_clock::time_point startTime;
+  glm::vec4 mouseState{0.0f, 0.0f, -1.0f, -1.0f};
 };

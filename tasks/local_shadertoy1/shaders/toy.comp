@@ -1,18 +1,260 @@
-#version 430
+#version 450
 
-layout(local_size_x = 32, local_size_y = 32) in;
+layout(local_size_x = 16, local_size_y = 16) in;
 
-layout(binding = 0, rgba8) uniform image2D resultImage;
+layout(binding = 0, rgba16f) uniform writeonly image2D resultImage;
 
+layout(push_constant) uniform Params
+{
+  vec4 mouse;
+  vec2 resolution;
+  float time;
+} params;
+
+#define iTime params.time
+#define iResolution params.resolution
+#define iMouse params.mouse
+
+#define MAX_STEPS 160
+#define MAX_DIST  60.0
+#define SURF_EPS  0.0008
+
+mat2 rot(float a) { float c = cos(a), s = sin(a); return mat2(c, -s, s, c); }
+
+float smin(float a, float b, float k) {
+    float h = clamp(0.5 + 0.5 * (b - a) / k, 0.0, 1.0);
+    return mix(b, a, h) - k * h * (1.0 - h);
+}
+
+vec3 palette(float t) {
+    return 0.5 + 0.5 * cos(6.28318 * (t + vec3(0.00, 0.33, 0.67)));
+}
+
+float sdSphere(vec3 p, float r) { return length(p) - r; }
+
+float sdTorus(vec3 p, vec2 t) {
+    vec2 q = vec2(length(p.xz) - t.x, p.y);
+    return length(q) - t.y;
+}
+
+float sdCapsule(vec3 p, vec3 a, vec3 b, float r) {
+    vec3 pa = p - a, ba = b - a;
+    float h = clamp(dot(pa, ba) / dot(ba, ba), 0.0, 1.0);
+    return length(pa - ba * h) - r;
+}
+
+float sdBox(vec3 p, vec3 b) {
+    vec3 q = abs(p) - b;
+    return length(max(q, 0.0)) + min(max(q.x, max(q.y, q.z)), 0.0);
+}
+
+vec2 map(vec3 p) {
+    float t = iTime;
+
+    float floorD = p.y + 1.0;
+    vec2 res = vec2(floorD, 0.0);
+
+    float ped = sdBox(p - vec3(0.0, -0.85, 0.0), vec3(1.6, 0.15, 1.6)) - 0.05;
+    if (ped < res.x) res = vec2(ped, 2.0);
+
+    vec3 q = p - vec3(0.0, 0.9, 0.0);
+    q.xy *= rot(0.35 * sin(t * 0.7));
+    q.xz *= rot(t * 0.5);
+    q.xz *= rot(q.y * 0.8);
+    float blob = sdTorus(q, vec2(1.05, 0.22 + 0.04 * sin(atan(q.z, q.x) * 6.0 + t * 3.0)));
+
+    for (int i = 0; i < 6; i++) {
+        float fi = float(i);
+        float a = t * (0.6 + 0.15 * fi) + fi * 1.047;
+        vec3 c = vec3(cos(a) * 1.2,
+                      0.9 + 0.7 * sin(t * 0.9 + fi * 2.1),
+                      sin(a) * 1.2);
+        float r = 0.22 + 0.08 * sin(t + fi);
+        blob = smin(blob, sdSphere(p - c, r), 0.45);
+    }
+
+    blob = smin(blob, sdSphere(p - vec3(0.0, 0.9, 0.0), 0.35 + 0.1 * sin(t * 2.0)), 0.5);
+
+    float stem = sdCapsule(p, vec3(0.0, -0.7, 0.0), vec3(0.0, 0.9, 0.0),
+                           0.06 + 0.03 * sin(p.y * 6.0 - t * 4.0));
+    blob = smin(blob, stem, 0.3);
+    blob = smin(blob, sdSphere(p - vec3(0.0, -0.75, 0.0), 0.2), 0.4);
+
+    blob *= 0.75;
+
+    if (blob < res.x) res = vec2(blob, 1.0);
+    return res;
+}
+
+vec3 calcNormal(vec3 p) {
+    const vec2 k = vec2(1.0, -1.0);
+    const float h = 0.0005;
+    return normalize(k.xyy * map(p + k.xyy * h).x +
+                     k.yyx * map(p + k.yyx * h).x +
+                     k.yxy * map(p + k.yxy * h).x +
+                     k.xxx * map(p + k.xxx * h).x);
+}
+
+vec2 raymarch(vec3 ro, vec3 rd) {
+    float d = 0.0;
+    float id = -1.0;
+    for (int i = 0; i < MAX_STEPS; i++) {
+        vec2 h = map(ro + rd * d);
+        if (abs(h.x) < SURF_EPS * max(d, 1.0)) { id = h.y; break; }
+        d += h.x;
+        if (d > MAX_DIST) break;
+    }
+    return vec2(d, id);
+}
+
+float softShadow(vec3 ro, vec3 rd, float mint, float maxt, float k) {
+    float res = 1.0;
+    float t = mint;
+    for (int i = 0; i < 64; i++) {
+        float h = map(ro + rd * t).x;
+        res = min(res, k * h / t);
+        t += clamp(h, 0.02, 0.25);
+        if (res < 0.001 || t > maxt) break;
+    }
+    return clamp(res, 0.0, 1.0);
+}
+
+float calcAO(vec3 p, vec3 n) {
+    float occ = 0.0, sca = 1.0;
+    for (int i = 0; i < 5; i++) {
+        float h = 0.01 + 0.12 * float(i);
+        float d = map(p + n * h).x;
+        occ += (h - d) * sca;
+        sca *= 0.9;
+    }
+    return clamp(1.0 - 2.5 * occ, 0.0, 1.0);
+}
+
+vec3 sky(vec3 rd) {
+    vec3 col = mix(vec3(0.02, 0.02, 0.05), vec3(0.18, 0.10, 0.28), pow(max(rd.y, 0.0), 0.5));
+    col += vec3(1.0, 0.55, 0.25) * pow(max(dot(rd, normalize(vec3(0.6, 0.35, -0.7))), 0.0), 24.0) * 0.6;
+    return col;
+}
+
+struct Material { vec3 albedo; float kd; float ks; float shininess; float refl; };
+
+Material getMaterial(vec3 p, vec3 n, float id, float sharp) {
+    Material m;
+    if (id < 0.5) {
+        float s = sin(3.14159 * p.x) * sin(3.14159 * p.z);
+        float c = 0.5 + 0.5 * clamp(s * sharp, -1.0, 1.0);
+        m.albedo = mix(vec3(0.05), vec3(0.22, 0.20, 0.25), c);
+        m.kd = 0.8; m.ks = 0.4; m.shininess = 32.0; m.refl = 0.35;
+    } else if (id < 1.5) {
+        float f = 0.25 * iTime + 0.35 * p.y + 0.3 * dot(n, vec3(0.3, 0.8, 0.1));
+        m.albedo = palette(f);
+        m.kd = 0.6; m.ks = 1.2; m.shininess = 96.0; m.refl = 0.5;
+    } else {
+        m.albedo = vec3(0.10, 0.10, 0.12);
+        m.kd = 0.7; m.ks = 0.8; m.shininess = 64.0; m.refl = 0.2;
+    }
+    return m;
+}
+
+vec3 phong(vec3 p, vec3 n, vec3 v, Material m, vec3 lPos, vec3 lCol, bool shadows) {
+    vec3 l = lPos - p;
+    float dist = length(l);
+    l /= dist;
+    float att = 1.0 / (1.0 + 0.02 * dist * dist);
+
+    float diff = max(dot(n, l), 0.0);
+    vec3  r    = reflect(-l, n);
+    float spec = pow(max(dot(r, v), 0.0), m.shininess);
+
+    float sh = 1.0;
+    if (shadows && diff > 0.0) sh = softShadow(p + n * 0.01, l, 0.02, dist, 12.0);
+
+    return lCol * att * sh * (m.kd * diff * m.albedo + m.ks * spec);
+}
+
+vec3 shade(vec3 ro, vec3 rd, vec2 hit, bool full) {
+    vec3 p = ro + rd * hit.x;
+    vec3 n = calcNormal(p);
+    vec3 v = -rd;
+    Material m = getMaterial(p, n, hit.y, full ? 60.0 / (1.0 + hit.x * hit.x * 0.15) : 0.0);
+
+    float t = iTime;
+    vec3 l1 = vec3(4.0 * cos(t * 0.3), 5.0, 4.0 * sin(t * 0.3));
+    vec3 l2 = vec3(-4.0, 2.5, -3.0);
+
+    float ao = calcAO(p, n);
+    vec3 col = 0.06 * m.albedo * ao;
+    col += phong(p, n, v, m, l1, vec3(1.0, 0.85, 0.7) * 1.6, full);
+    col += phong(p, n, v, m, l2, vec3(0.3, 0.5, 1.0) * 1.2, full);
+
+    float rim = pow(1.0 - max(dot(n, v), 0.0), 3.0);
+    col += rim * 0.25 * m.albedo * ao;
+
+    col = mix(col, sky(rd), 1.0 - exp(-0.0025 * hit.x * hit.x));
+    return col;
+}
+
+vec3 render(vec3 ro, vec3 rd) {
+    vec2 hit = raymarch(ro, rd);
+    if (hit.y < 0.0) return sky(rd);
+
+    vec3 col = shade(ro, rd, hit, true);
+
+    vec3 p = ro + rd * hit.x;
+    vec3 n = calcNormal(p);
+    Material m = getMaterial(p, n, hit.y, 1.0);
+    float fres = m.refl + (1.0 - m.refl) * pow(1.0 - max(dot(n, -rd), 0.0), 5.0);
+    vec3 rrd = reflect(rd, n);
+    vec3 rro = p + n * 0.02;
+    vec2 rhit = raymarch(rro, rrd);
+    vec3 rcol = rhit.y < 0.0 ? sky(rrd) : shade(rro, rrd, rhit, false);
+    col = mix(col, rcol, fres * m.refl * 1.6);
+
+    return col;
+}
+
+mat3 lookAt(vec3 ro, vec3 ta) {
+    vec3 f = normalize(ta - ro);
+    vec3 r = normalize(cross(vec3(0.0, 1.0, 0.0), f));
+    vec3 u = cross(f, r);
+    return mat3(r, u, f);
+}
+
+void mainImage(out vec4 fragColor, in vec2 fragCoord) {
+    vec2 uv = (2.0 * fragCoord - iResolution.xy) / iResolution.y;
+
+    float yaw   = 0.15 * iTime;
+    float pitch = 0.28;
+    if (iMouse.z > 0.0) {
+        yaw   = 6.28318 * iMouse.x / iResolution.x;
+        pitch = mix(-0.1, 1.2, iMouse.y / iResolution.y);
+    }
+    float radius = 5.2;
+    vec3 ro = vec3(radius * cos(yaw) * cos(pitch),
+                   radius * sin(pitch) + 0.6,
+                   radius * sin(yaw) * cos(pitch));
+    vec3 ta = vec3(0.0, 0.4, 0.0);
+    vec3 rd = lookAt(ro, ta) * normalize(vec3(uv, 1.8));
+
+    vec3 col = render(ro, rd);
+
+    col = col / (1.0 + col);
+    vec2 q = fragCoord / iResolution.xy;
+    col *= 0.5 + 0.5 * pow(16.0 * q.x * q.y * (1.0 - q.x) * (1.0 - q.y), 0.2);
+
+    fragColor = vec4(col, 1.0);
+}
 
 void main()
 {
-  ivec2 uv = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(resultImage);
+    ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
+    if (pix.x >= size.x || pix.y >= size.y)
+        return;
 
-  // TODO: Put your shadertoy code here!
-  // Simple gradient as a test.
-  vec3 color = vec3(vec2(uv) / vec2(1280, 720), 0);
+    vec2 fragCoord = vec2(pix.x, size.y - 1 - pix.y) + 0.5;
 
-  if (uv.x < 1280 && uv.y < 720)
-    imageStore(resultImage, uv, vec4(color, 1));
+    vec4 color;
+    mainImage(color, fragCoord);
+    imageStore(resultImage, pix, color);
 }

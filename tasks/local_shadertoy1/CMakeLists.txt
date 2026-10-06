@@ -10,3 +10,4 @@ target_link_libraries(local_shadertoy1
 target_add_shaders(local_shadertoy1
   shaders/toy.comp
 )
+target_compile_definitions(local_shadertoy1 PRIVATE LOCAL_SHADERTOY_BUILD_DIR="${CMAKE_BINARY_DIR}")
