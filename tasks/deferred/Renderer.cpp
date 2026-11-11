@@ -31,7 +31,8 @@ void Renderer::initVulkan(std::span<const char*> instance_extensions)
     .applicationVersion = VK_MAKE_VERSION(0, 1, 0),
     .instanceExtensions = instanceExtensions,
     .deviceExtensions = deviceExtensions,
-    .features = vk::PhysicalDeviceFeatures2{.features = {}},
+    // independentBlend: decals use different color write masks per G-buffer attachment
+    .features = vk::PhysicalDeviceFeatures2{.features = {.independentBlend = vk::True}},
     // Replace with an index if etna detects your preferred GPU incorrectly
     .physicalDeviceIndexOverride = {},
     // How much frames we buffer on the GPU without waiting for their completion on the CPU
