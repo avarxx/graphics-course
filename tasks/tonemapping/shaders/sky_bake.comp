@@ -1,0 +1,330 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+// Bakes the procedural sky into a cubemap (R16G16B16A16_SFLOAT, 6 layers):
+//   1. sky gradient (light blue at the horizon -> dark blue at the zenith) + sun glow,
+//   2. volumetric clouds: fBm density in a spherical shell, ray marching with light marching
+//      towards the sun for self-shadowing.
+// RGB = sky with clouds, A = transmittance of the cloud layer along the texel direction.
+//
+// One invocation per texel, z = face (the dispatch may cover only some of the faces, see
+// SkyParams::offset.w), so the same function is used for every face and the result is
+// continuous across face borders.
+
+#include "SkyParams.h"
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(binding = 0, rgba16f) uniform writeonly image2DArray skyCube;
+
+layout(binding = 1) uniform SkyUbo
+{
+  SkyParams sky;
+};
+
+const float PI = 3.14159265359;
+const float EARTH_RADIUS = 6360e3;
+
+// ---------------------------------------------------------------------------------------------
+// Cubemap texel -> world direction (Vulkan / GL cubemap convention, face order +X -X +Y -Y +Z -Z)
+// ---------------------------------------------------------------------------------------------
+vec3 cubeTexelDir(uint face, vec2 uv)
+{
+  // uv in [0,1]^2, (0,0) = top-left texel corner of the face
+  const float sc = uv.x * 2.0 - 1.0;
+  const float tc = uv.y * 2.0 - 1.0;
+  vec3 d;
+  switch (face)
+  {
+  case 0: d = vec3(1.0, -tc, -sc); break;
+  case 1: d = vec3(-1.0, -tc, sc); break;
+  case 2: d = vec3(sc, 1.0, tc); break;
+  case 3: d = vec3(sc, -1.0, -tc); break;
+  case 4: d = vec3(sc, -tc, 1.0); break;
+  default: d = vec3(-sc, -tc, -1.0); break;
+  }
+  return normalize(d);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Noise
+// ---------------------------------------------------------------------------------------------
+uvec3 pcg3d(uvec3 v)
+{
+  v = v * 1664525u + 1013904223u;
+  v.x += v.y * v.z;
+  v.y += v.z * v.x;
+  v.z += v.x * v.y;
+  v ^= v >> 16u;
+  v.x += v.y * v.z;
+  v.y += v.z * v.x;
+  v.z += v.x * v.y;
+  return v;
+}
+
+vec3 hashGrad(ivec3 c)
+{
+  const uvec3 h = pcg3d(uvec3(c + ivec3(1 << 20)));
+  return normalize(vec3(h & 0xFFFFu) / 32767.5 - 1.0 + 1e-4);
+}
+
+// 3D gradient (Perlin-style) noise, roughly in [-1, 1]
+float gradientNoise(vec3 p)
+{
+  const ivec3 i = ivec3(floor(p));
+  const vec3 f = fract(p);
+  const vec3 u = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
+
+  const float n000 = dot(hashGrad(i + ivec3(0, 0, 0)), f - vec3(0, 0, 0));
+  const float n100 = dot(hashGrad(i + ivec3(1, 0, 0)), f - vec3(1, 0, 0));
+  const float n010 = dot(hashGrad(i + ivec3(0, 1, 0)), f - vec3(0, 1, 0));
+  const float n110 = dot(hashGrad(i + ivec3(1, 1, 0)), f - vec3(1, 1, 0));
+  const float n001 = dot(hashGrad(i + ivec3(0, 0, 1)), f - vec3(0, 0, 1));
+  const float n101 = dot(hashGrad(i + ivec3(1, 0, 1)), f - vec3(1, 0, 1));
+  const float n011 = dot(hashGrad(i + ivec3(0, 1, 1)), f - vec3(0, 1, 1));
+  const float n111 = dot(hashGrad(i + ivec3(1, 1, 1)), f - vec3(1, 1, 1));
+
+  return mix(
+    mix(mix(n000, n100, u.x), mix(n010, n110, u.x), u.y),
+    mix(mix(n001, n101, u.x), mix(n011, n111, u.x), u.y),
+    u.z) * 1.6;
+}
+
+// Rotation between octaves hides the axis-aligned lattice
+const mat3 OCTAVE_ROT = mat3(0.00, 0.80, 0.60, -0.80, 0.36, -0.48, -0.60, -0.48, 0.64);
+
+// Multi-octave noise (fractional Brownian motion), roughly in [-1, 1]
+float fbm(vec3 p, int octaves)
+{
+  float sum = 0.0;
+  float amp = 0.5;
+  float norm = 0.0;
+  for (int i = 0; i < octaves; ++i)
+  {
+    sum += amp * gradientNoise(p);
+    norm += amp;
+    p = OCTAVE_ROT * p * 2.03;
+    amp *= 0.5;
+  }
+  return sum / norm;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Sky
+// ---------------------------------------------------------------------------------------------
+vec3 skyGradient(vec3 dir)
+{
+  // t = 0.5 at the horizon (half/half), t = 1 at the zenith (dark blue only)
+  const float t = clamp(dir.y * 0.5 + 0.5, 0.0, 1.0);
+  return mix(sky.horizonColor.rgb, sky.zenithColor.rgb, t) * sky.horizonColor.w;
+}
+
+vec3 sunGlow(vec3 dir)
+{
+  const float theta = acos(clamp(dot(dir, sky.sunDir.xyz), -1.0, 1.0));
+  const float glow = sky.sunGlow.x * exp(-theta * theta * sky.sunGlow.z) +
+    sky.sunGlow.y * exp(-theta * sky.sunGlow.w);
+  return sky.sunColor.rgb * sky.sunDir.w * glow;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Clouds
+// ---------------------------------------------------------------------------------------------
+
+// Distance along a ray starting at `origin` (inside the sphere) to the sphere of the given radius
+// centered at the planet center (0, -EARTH_RADIUS, 0)
+float distToShell(vec3 origin, vec3 dir, float radius)
+{
+  const vec3 oc = origin + vec3(0.0, EARTH_RADIUS, 0.0);
+  const float b = dot(oc, dir);
+  const float c = dot(oc, oc) - radius * radius;
+  const float disc = b * b - c;
+  return -b + sqrt(max(disc, 0.0));
+}
+
+float altitude(vec3 p)
+{
+  return length(p + vec3(0.0, EARTH_RADIUS, 0.0)) - EARTH_RADIUS;
+}
+
+// Cloud density at point p (meters). `detailed` adds the high-frequency erosion octaves,
+// the light march uses the cheap version.
+float cloudDensity(vec3 p, bool detailed)
+{
+  const float bottom = sky.layer.x;
+  const float top = sky.layer.y;
+  const float h = clamp((altitude(p) - bottom) / max(top - bottom, 1.0), 0.0, 1.0);
+
+  // Vertical profile: smooth fade-in at the bottom, rounder and thinner towards the top
+  const float profile = smoothstep(0.0, 0.12, h) * smoothstep(1.0, 0.55, h);
+  if (profile <= 0.0)
+    return 0.0;
+
+  const vec3 q = (p + sky.offset.xyz) / sky.clouds.z;
+  // Large-scale shape, slightly stretched horizontally like real cumulus fields
+  float shape = fbm(q * vec3(1.0, 1.6, 1.0), 5) * 0.5 + 0.5;
+  shape *= mix(0.55, 1.0, profile);
+
+  const float coverage = sky.clouds.x;
+  const float threshold = mix(0.78, 0.28, coverage);
+  float d = smoothstep(threshold, threshold + 0.22, shape);
+  if (d <= 0.0)
+    return 0.0;
+
+  if (detailed && sky.lighting.z > 0.0)
+  {
+    // Erode the edges with higher-frequency noise: billowy, wispy borders
+    const float detail = fbm(q * 5.3 + vec3(17.0), 3) * 0.5 + 0.5;
+    d = clamp(d - sky.lighting.z * detail * (1.0 - d), 0.0, 1.0);
+  }
+
+  return d * profile;
+}
+
+float henyeyGreenstein(float cosTheta, float g)
+{
+  const float g2 = g * g;
+  return (1.0 - g2) / (4.0 * PI * pow(max(1.0 + g2 - 2.0 * g * cosTheta, 1e-4), 1.5));
+}
+
+// Optical depth from p towards the sun through the cloud layer (cheap density)
+float lightOpticalDepth(vec3 p)
+{
+  const int steps = int(sky.layer.w);
+  const float sigma = sky.clouds.y;
+  const vec3 L = sky.sunDir.xyz;
+  // Steps grow geometrically: fine near the sample, coarse far away
+  float stepLen = 0.6 * (sky.layer.y - sky.layer.x) / float(max(steps * steps, 1));
+  float t = 0.0;
+  float tau = 0.0;
+  for (int i = 0; i < steps; ++i)
+  {
+    const float len = stepLen * float(2 * i + 1);
+    t += len * 0.5;
+    tau += cloudDensity(p + L * t, false) * sigma * len;
+    t += len * 0.5;
+  }
+  return tau;
+}
+
+// Per-texel random offset of the first step: turns banding of the coarse march into fine noise.
+// (White noise: interleaved gradient noise left a visible diagonal pattern in the clouds.)
+float jitter(uvec2 texel, uint face)
+{
+  return float(pcg3d(uvec3(texel, face)).x & 0xFFFFu) / 65536.0;
+}
+
+// Returns rgb = in-scattered light of the clouds, a = transmittance; dist = mean distance
+vec4 marchClouds(vec3 dir, uvec2 texel, uint face, out float dist)
+{
+  dist = 0.0;
+  // Observer slightly above the ground. Rays that go below the horizon hit the planet first.
+  const vec3 origin = vec3(0.0, 2.0, 0.0);
+  if (dir.y <= 0.0)
+    return vec4(0.0, 0.0, 0.0, 1.0);
+
+  const float tStart = distToShell(origin, dir, EARTH_RADIUS + sky.layer.x);
+  float tEnd = distToShell(origin, dir, EARTH_RADIUS + sky.layer.y);
+  // Very slanted rays near the horizon cross hundreds of kilometers of the layer: clamp
+  tEnd = min(tEnd, tStart + 40000.0);
+
+  // Far clouds are invisible behind the haze anyway
+  if (exp(-tStart / sky.lighting.w) < 0.01)
+    return vec4(0.0, 0.0, 0.0, 1.0);
+
+  const int steps = int(sky.layer.z);
+  const float dt = (tEnd - tStart) / float(steps);
+  const float sigma = sky.clouds.y;
+
+  const float cosTheta = dot(dir, sky.sunDir.xyz);
+
+  const vec3 sunLight = sky.sunColor.rgb * sky.sunDir.w;
+  const vec3 ambientLight = skyGradient(vec3(0.0, 1.0, 0.0)) * 0.5 + skyGradient(vec3(0.0, 0.0, 1.0)) * 0.5;
+
+  vec3 scattered = vec3(0.0);
+  float T = 1.0;
+  float weightedDist = 0.0;
+  float weight = 0.0;
+
+  float t = tStart + dt * jitter(texel, face);
+  for (int i = 0; i < steps; ++i, t += dt)
+  {
+    const vec3 p = origin + dir * t;
+    const float d = cloudDensity(p, true);
+    if (d <= 0.0)
+      continue;
+
+    const float extinction = d * sigma;
+    const float h = clamp((altitude(p) - sky.layer.x) / (sky.layer.y - sky.layer.x), 0.0, 1.0);
+
+    // Self-shadowing: optical depth towards the sun
+    const float tau = lightOpticalDepth(p);
+
+    // Multiple scattering approximation (Wrenninge et al., "Oz: The Great and Volumetric", 2013):
+    // a sum of single-scattering "octaves" with weaker extinction and a more isotropic phase.
+    // Clouds have albedo ~1, almost all light leaves them after many scattering events, which is
+    // why their lit side is as bright as a white diffuse surface. Single scattering alone gives
+    // a dark grey.
+    float sunScatter = 0.0;
+    float a = 1.0, b = 1.0, c = 1.0;
+    for (int o = 0; o < 4; ++o)
+    {
+      // Strong forward lobe (silver lining) + weak back scattering
+      const float phase = mix(
+        henyeyGreenstein(cosTheta, sky.lighting.y * c), henyeyGreenstein(cosTheta, -0.2 * c), 0.25);
+      sunScatter += a * exp(-tau * b) * phase;
+      a *= 0.6;
+      b *= 0.35;
+      c *= 0.5;
+    }
+
+    // Bottoms of the clouds see less of the sky
+    const vec3 ambient = ambientLight * sky.lighting.x * mix(0.45, 1.0, h);
+    const vec3 S = sunLight * sunScatter * sky.zenithColor.w + ambient;
+
+    // Energy-conserving integration over the step (Hillaire 2015)
+    const float stepT = exp(-extinction * dt);
+    const vec3 contribution = T * S * (1.0 - stepT);
+    scattered += contribution;
+    weightedDist += t * T * (1.0 - stepT);
+    weight += T * (1.0 - stepT);
+    T *= stepT;
+
+    if (T < 0.005)
+    {
+      T = 0.0;
+      break;
+    }
+  }
+
+  dist = weight > 0.0 ? weightedDist / weight : tStart;
+  return vec4(scattered, T);
+}
+
+void main()
+{
+  const uint size = uint(sky.sunColor.w);
+  const uvec2 texel = gl_GlobalInvocationID.xy;
+  const uint face = gl_GlobalInvocationID.z + uint(sky.offset.w);
+  if (texel.x >= size || texel.y >= size)
+    return;
+
+  const vec3 dir = cubeTexelDir(face, (vec2(texel) + 0.5) / float(size));
+
+  // Sun glow is added to the gradient BEFORE the clouds, so the clouds hide it
+  const vec3 background = skyGradient(dir) + sunGlow(dir);
+
+  vec3 color = background;
+  float transmittance = 1.0;
+  if (sky.clouds.w > 0.5)
+  {
+    float dist;
+    const vec4 c = marchClouds(dir, texel, face, dist);
+    // Aerial perspective: distant clouds fade into the sky
+    const float fade = exp(-dist / sky.lighting.w);
+    transmittance = mix(1.0, c.a, fade);
+    color = mix(background, background * c.a + c.rgb, fade);
+  }
+
+  imageStore(skyCube, ivec3(texel, face), vec4(color, transmittance));
+}
