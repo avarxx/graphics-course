@@ -19,7 +19,7 @@ jobs:
             install: sudo apt install g++-14
           - cxx: clang++-17
             cxxflags: -stdlib=libc++
-            install: sudo apt install clang-17 libc++-17-dev libc++abi-17-dev
+            install: sudo apt install clang-17 libc++-17-dev libc++abi-17-dev libunwind-17-dev
 
     steps:
     - uses: actions/checkout@v4

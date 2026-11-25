@@ -1,0 +1,95 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+// Pass 3: picks the exposure of the frame from the luminance histogram and smooths it in time.
+// A single invocation: 100 bins are nothing.
+
+#include "TonemapParams.h"
+#include "luminance.glsl"
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0, std430) buffer TonemapStateBuffer
+{
+  TonemapState state;
+};
+
+layout(push_constant) uniform Push
+{
+  TonemapPush pc;
+};
+
+void main()
+{
+  const float lo = orderedUintToFloat(state.minLogBits);
+  const float hi = orderedUintToFloat(state.maxLogBits);
+  const float binWidth = max(hi - lo, 1e-4) / float(HIST_BINS);
+
+  uint total = 0u;
+  for (int i = 0; i < HIST_BINS; ++i)
+    total += state.histogram[i];
+
+  const int method = int(pc.frame.w + 0.5);
+  float target = 0.0;
+  if (total == 0u)
+    target = state.adaptedLogLum;
+  else if (method == EXPOSURE_MEAN)
+  {
+    // Mean of log luminance = log of the geometric mean of luminance
+    float sum = 0.0;
+    for (int i = 0; i < HIST_BINS; ++i)
+      sum += float(state.histogram[i]) * (lo + (float(i) + 0.5) * binWidth);
+    target = sum / float(total);
+  }
+  else
+  {
+    // Trimmed mean: average only the pixels between the low and the high percentile. The darkest
+    // pixels (deep shadows, under water) and the brightest ones (sun, specular highlights) are
+    // ignored, so a tiny bright sun disk entering the frame does not darken everything.
+    // The median is the degenerate case low = high = 0.5.
+    const float lowP = method == EXPOSURE_MEDIAN ? 0.5 : pc.range.x;
+    const float highP = method == EXPOSURE_MEDIAN ? 0.5 : max(pc.range.y, pc.range.x);
+    const float lowCount = lowP * float(total);
+    const float highCount = highP * float(total);
+
+    float sum = 0.0;
+    float weight = 0.0;
+    float cumulative = 0.0;
+    float medianValue = lo;
+    for (int i = 0; i < HIST_BINS; ++i)
+    {
+      const float count = float(state.histogram[i]);
+      const float binLo = lo + float(i) * binWidth;
+      // Median: interpolate inside the bin where the cumulative count crosses the middle
+      if (cumulative <= lowCount && cumulative + count > lowCount)
+        medianValue = binLo + binWidth * (lowCount - cumulative) / count;
+      const float inside =
+        clamp(cumulative + count, lowCount, highCount) - clamp(cumulative, lowCount, highCount);
+      sum += inside * (binLo + 0.5 * binWidth);
+      weight += inside;
+      cumulative += count;
+    }
+    target = method == EXPOSURE_MEDIAN || weight <= 0.0 ? medianValue : sum / weight;
+  }
+
+  // Do not adapt to extreme scenes (looking straight at the sun, pitch black)
+  target = clamp(target, pc.range.z, pc.range.w);
+  state.targetLogLum = target;
+
+  // Temporal adaptation in log space (perceptually uniform), the eye adapts faster to bright
+  // light than to darkness. Frame-rate independent: 1 - exp(-dt * speed).
+  if (state.initialized == 0u)
+  {
+    state.adaptedLogLum = target;
+    state.initialized = 1u;
+  }
+  else
+  {
+    const float speed = target > state.adaptedLogLum ? pc.adapt.x : pc.adapt.y;
+    const float k = 1.0 - exp(-pc.frame.z * speed);
+    state.adaptedLogLum += (target - state.adaptedLogLum) * k;
+  }
+
+  // The adapted luminance is mapped to the "key" value (middle grey, 0.18 by default)
+  state.exposure = pc.adapt.z / exp2(state.adaptedLogLum);
+}
