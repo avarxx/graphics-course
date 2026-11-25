@@ -1,0 +1,185 @@
+#version 450
+#extension GL_ARB_separate_shader_objects : enable
+#extension GL_GOOGLE_include_directive : require
+
+// GPU grass placement. One invocation per grid cell around the camera:
+//   * the cell is deterministic (hash of world cell coordinates), so blades never swim while
+//     the camera moves;
+//   * a per-cell frustum test rejects whole cells, a per-blade test rejects individual blades;
+//   * the density falls off smoothly towards the draw distance, so blades do not pop in;
+//   * terrain height and biome (sand / grass / rock / snow) decide whether grass can grow here;
+//   * a sparse-grass placement mask breaks up the distribution into natural clumps.
+// Visible blades are appended to a storage buffer with atomicAdd; the same atomic increments the
+// instanceCount of a VkDrawIndexedIndirectCommand, so the CPU never reads the count back.
+
+#include "SceneParams.h"
+#include "GrassParams.h"
+#include "terrain_common.glsl"
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(binding = 0) uniform SceneUbo
+{
+  SceneParams params;
+};
+
+layout(binding = 1) uniform sampler2D heightMap;
+layout(binding = 2) uniform sampler2D grassMask;
+
+struct GrassInstance
+{
+  vec4 posHeight;
+  vec4 shape;
+  vec4 color;
+};
+
+layout(std430, binding = 3) writeonly buffer Instances
+{
+  GrassInstance instances[];
+};
+
+layout(std430, binding = 4) buffer DrawArgs
+{
+  uint indexCount;
+  uint instanceCount;
+  uint firstIndex;
+  int vertexOffset;
+  uint firstInstance;
+} drawArgs;
+
+layout(push_constant) uniform Push
+{
+  GrassPlacementPush pc;
+};
+
+const float PI = 3.14159265359;
+
+uint hashU(uint x, uint y, uint z)
+{
+  uint state = x * 747796405u + 2891336453u;
+  state = (state ^ (state >> ((state >> 28u) + 4u))) * 277803737u;
+  state ^= y * 2246822519u;
+  state = (state ^ (state >> 13u)) * 3266489917u;
+  state ^= z * 668265263u;
+  return state ^ (state >> 16u);
+}
+
+float rand01(inout uint state)
+{
+  state = state * 747796405u + 2891336453u;
+  uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+  return float((word >> 22u) ^ word) * (1.0 / 4294967296.0);
+}
+
+// Gribb-Hartmann frustum planes from the camera view-projection
+bool sphereVisible(vec3 center, float radius)
+{
+  const mat4 t = transpose(params.viewProj);
+  const vec4 planes[6] = {
+    t[3] + t[0], t[3] - t[0],
+    t[3] + t[1], t[3] - t[1],
+    t[3] + t[2], t[3] - t[2],
+  };
+  for (int i = 0; i < 6; ++i)
+  {
+    const float d = dot(planes[i].xyz, center) + planes[i].w;
+    if (d < -radius)
+      return false;
+  }
+  return true;
+}
+
+void main()
+{
+  const int cellsPerSide = int(pc.grid.x + 0.5);
+  const ivec2 local = ivec2(gl_GlobalInvocationID.xy);
+  if (local.x >= cellsPerSide || local.y >= cellsPerSide)
+    return;
+
+  const float cellSize = pc.grid.y;
+  const float radius = pc.grid.z;
+  const int bladesPerCell = int(pc.grid.w + 0.5);
+  if (bladesPerCell <= 0)
+    return;
+
+  const vec3 cam = params.cameraPos.xyz;
+  const vec2 camCell = floor(cam.xz / cellSize);
+  const ivec2 cell = ivec2(camCell) + local - ivec2(cellsPerSide / 2);
+  const vec2 cellCenter = (vec2(cell) + 0.5) * cellSize;
+
+  // Cheap whole-cell rejection before touching the terrain or generating any blades
+  const vec2 centerUv = cellCenter / params.terrainSize.x + 0.5;
+  const float centerH = sampleHeight(heightMap, centerUv) * params.terrainSize.y;
+  const vec3 cellWorld = vec3(cellCenter.x, centerH, cellCenter.y);
+  if (pc.extra.y > 0.5 && !sphereVisible(cellWorld, cellSize + params.grassShape.x))
+    return;
+
+  for (int i = 0; i < bladesPerCell; ++i)
+  {
+    uint state = hashU(uint(cell.x), uint(cell.y), uint(pc.extra.x) * 9781u + uint(i) * 6271u);
+    const float r0 = rand01(state);
+    const float r1 = rand01(state);
+    const float r2 = rand01(state);
+    const float r3 = rand01(state);
+    const float r4 = rand01(state);
+    const float r5 = rand01(state);
+    const float r6 = rand01(state);
+    const float r7 = rand01(state);
+
+    const vec2 xz = cellCenter + (vec2(r0, r1) - 0.5) * cellSize * 0.92;
+    const float dist = length(xz - cam.xz);
+    if (dist > radius)
+      continue;
+
+    // Smooth density falloff: at the edge of the draw distance fewer and fewer blades pass
+    const float fade = 1.0 - smoothstep(radius * 0.72, radius, dist);
+    if (r2 > fade)
+      continue;
+
+    const vec2 uv = xz / params.terrainSize.x + 0.5;
+    if (uv.x <= 0.0 || uv.y <= 0.0 || uv.x >= 1.0 || uv.y >= 1.0)
+      continue;
+
+    const float hNorm = sampleHeight(heightMap, uv);
+    if (hNorm < params.terrainSize.z + 0.005)
+      continue;
+
+    // Biome: sand -> grass -> rock -> snow thresholds from the terrain material. Grass is
+    // densest in the grass band, thinner at the edges and does not grow on steep slopes.
+    const vec4 layers = params.layerHeights;
+    const float bw = max(layers.w, 1e-3);
+    float biome = smoothstep(layers.x - bw, layers.x + bw, hNorm) *
+      (1.0 - smoothstep(layers.y - bw, layers.y + bw, hNorm));
+
+    const vec3 n = terrainNormal(
+      heightMap, uv, params.terrainSize.x, params.terrainSize.y);
+    const float slope = 1.0 - n.y;
+    biome *= 1.0 - smoothstep(0.30, 0.60, slope);
+
+    const float mask = textureLod(grassMask, xz * 0.025, 0.0).r;
+    biome *= 0.30 + 1.45 * mask;
+    biome *= params.grassShape.z;
+
+    if (r3 > biome)
+      continue;
+
+    const vec3 pos = vec3(xz.x, hNorm * params.terrainSize.y, xz.y);
+    const float bladeHeight = params.grassShape.x * (0.55 + 0.9 * r4);
+    const float bladeWidth = params.grassShape.y * (0.65 + 0.7 * r5);
+    const float yaw = (r6 * 2.0 - 1.0) * 0.65;
+    const float lean = 0.06 + 0.30 * r7;
+    const float phase = rand01(state) * 2.0 * PI;
+
+    // Patchy color: young green blades, dry yellow-brown ones
+    const vec3 green = mix(vec3(0.045, 0.13, 0.020), vec3(0.16, 0.28, 0.055), rand01(state));
+    const vec3 dry = vec3(0.26, 0.22, 0.07);
+    const vec3 color = mix(green, dry, rand01(state) * 0.22);
+
+    const uint idx = atomicAdd(drawArgs.instanceCount, 1u);
+    if (idx >= uint(GRASS_MAX_INSTANCES))
+      continue;
+    instances[idx].posHeight = vec4(pos, bladeHeight);
+    instances[idx].shape = vec4(bladeWidth, yaw, lean, phase);
+    instances[idx].color = vec4(color, 1.0);
+  }
+}
